@@ -1,0 +1,310 @@
+## Quesitons I'm trying to answer and proposed method
+
+  # The goal is to use National Hockey League play-by-play data to learn how shooters and goaltenders
+  # influence shot conversion. The website MoneyPuck.com provides downloadable csv files for all
+  # unblocked shots since 2007-2008 (http://moneypuck.com/about.htm). The response will be boolean 
+  # (1 = GOAL, 0 = SAVE or MISS). This calls for a logistic regression with both fixed and random 
+  # effects. Some potential fixed effects include variables like shot distance (in feet), shot angle 
+  # (degrees from center ice), shot type (SNAP/SLAP/WRIST/TIP/BACK/DEFL/WRAP), team (HOME/AWAY), season 
+  # (2018/2017/2016/2015), offwing (Y/N), speed from last event (ft/s), rush shot (Y/N), 
+  # rebound shot (Y/N), team venue (HOME/AWAY), shooting team game state (EV/PP/PK), and shooter 
+  # position (DEFENDER/FORWARD). Variables such as shooter and goaltender will be treated as random
+  # effects. Data from the 2015-16 season to the 2018-19 season will be used since we are assuming 
+  # that skater and goaltender talent is static, and thus we don't want too large of a window that 
+  # could allow for significant changes in talent due to injury and aging. Also, the shot location
+  # data in earlier seasons tends to be less accurate. 
+
+  # I will also be using arena-adjusted shot distances and angles in order to account for
+  # scorer bias. The method used to do so is outlined here if you're curious ->
+  # http://www.sloansportsconference.com/wp-content/uploads/2013/Total%20Hockey%20Rating%20(THoR)%20A%20comprehensive%20statistical%20rating%20of%20National%20Hockey%20League%20forwards%20and%20defensemen%20based%20upon%20all%20on-ice%20events.pdf
+
+## Loading data and full model fits (takes up to 60 seconds)
+  myURL = "https://www.dropbox.com/s/7x10wpgp6jwhkw5/galamind4C03.rda?raw=1"
+  #myURL = "https://www.dropbox.com/s/jzkj6h7t93lywu9/galamind.rda?raw=1"
+  myConnection = url(myURL)
+  print(load(myConnection))
+  close(myConnection) 
+  
+## Changes made to the raw data done prior to being loaded in from dropbox
+    #shots <- shots %>% select(goal, season, shotAngle, shotAngleAdjusted, arenaAdjustedShotDistance,
+                              #shotType, shotRush, shotRebound, speedFromLastEvent, homeSkatersOnIce, 
+                              #awaySkatersOnIce, goalieNameForShot, shooterName, homeTeamGoals,
+                              #awayTeamGoals, offWing,  location, team, homeEmptyNet, awayEmptyNet,
+                              #period, playerPositionThatDidEvent, timeSinceLastEvent, averageRestDifference,
+                              #lastEventCategory, lastEventTeam)
+
+## Data manipulation
+  
+  # Discard shots that occur in the neutral zone or defensive zone as these are typically
+  # dumps/clears to relieve opposition pressure and help initiate a line change. These incidental
+  # shots are almost never converted (although there have been a few infamous goals scored on these 
+  # attempts -> https://youtu.be/L9WuzswaKHs)
+    shots <- shots %>% filter((location == "AWAYZONE" & team == "HOME") | 
+              (location == "HOMEZONE" & team == "AWAY")) %>%
+  
+  # Remove events that occur with the goaltender pulled for either team (removes 8228 obs)
+    filter(homeEmptyNet == 0 & awayEmptyNet == 0) %>%
+
+  # Split position cateogry into forwards and defensemen as more granular delineations (L/R/C)
+  # for forwards are unreliable (for example, many forwards are listed as centers (Position = "C")
+  # because they were drafted as centers but they actually play on the wing at the NHL level)
+    mutate(Position = ifelse(playerPositionThatDidEvent == "D", "D", "F")) %>%
+  
+  # Define game state of shot attempts: even strength (EV), powerplay (PP) or penalty kill (PK).
+  # Even strength involves shots where both teams have the same number of skaters on the ice. A
+  # powerplay describes the state where the shooting team has a man-advantage and penalty kill 
+  # situations apply to shooting teams playing with fewer skaters on the ice than their opposition.
+    mutate(state = ifelse(awaySkatersOnIce == homeSkatersOnIce, "EV",
+      ifelse((awaySkatersOnIce > homeSkatersOnIce & team == "AWAY") |
+      (awaySkatersOnIce < homeSkatersOnIce & team == "HOME"), 
+      "PP", "PK"))) %>%
+    
+  # Remove shots with no specified shot type (removes 32 obs)
+    filter(shotType != "") %>%
+      
+  # Create a new factor, 'shotTurnover', which will be a binary indicator of whether or not a shot
+  # immediately followed a giveaway by the opposing team
+    mutate(shotTurnover = ifelse(lastEventCategory == "TAKE" & as.character(lastEventTeam) == 
+      as.character(team), 1, 
+      ifelse(lastEventCategory == "GIVE" & as.character(lastEventTeam) != 
+      as.character(team), 1, 0))) 
+    
+  # Convert season to factor
+    shots <- transform(shots, season = as.factor(season))
+    
+  # Take a random subset of the data for graphical exploration
+    set.seed(101)
+    dd <- shots[sample(nrow(shots), 50000), ]
+  
+## Graphical exploration
+  
+  # Let's see how shot distance relates to shot conversion by game state
+    ggplot(dd, aes(arenaAdjustedShotDistance, goal, colour = state0, fill = state)) +
+      geom_smooth() + facet_wrap(~state0,labeller=label_both) +
+      coord_cartesian(ylim=c(0,0.3))
+  
+  # It's apparent that shorter shot distances tend to result in higher conversion rates. This is 
+  # expected as being closer to the net makes it easier to hit a target and gives the opposing
+  # netminder less time to react. This holds true for all game states. There's a clear monotonic
+  # relationship between distance and conversion rates from 0-75 feet (the range which contains >99%
+  # of shots in the data set) and so we probably don't require higher order terms. These curves
+  # vary a bit from one game state to another and therefore it seems like a good idea to include
+  # a game state-shot distance interaction term
+  
+  # Let's make a similar plot, but for shot angle from center ice...
+    ggplot(dd, aes(shotAngleAdjusted, goal, colour= state, fill = state)) +
+      geom_smooth() + facet_wrap(~state,labeller=label_both) +
+      coord_cartesian(ylim=c(0,0.3))
+    
+  # So as expected, a sharper angle to the net typically results in a lower chance of scoring a goal.
+  # That said, this may not be the case on the powerplay given the plotted trend. A change in this
+  # relationship on the powerplay seems plausible given that the popular 1-3-1 powerplay setup 
+  # positions shooters on the wings at sharp angles in order to take advantage of quick, lateral 
+  # puck movement (and thus a sprawling, out-of-position netminder). Later we can see if the 
+  # inclusion of interactions between game state and shot angle improve the predictive power
+  # of our model
+    
+  # We have a few potentially relevant categorical variables. Here's shot type by game state
+  # and skater position...
+    ggplot(dd %>% group_by(shotType, state, Position) %>% summarise(ProportionScored = mean(goal),
+      n = length(goal)), aes(shotType, ProportionScored, col = state, size = n)) +
+      geom_point() + coord_cartesian(ylim=c(0,0.3)) + facet_wrap(~Position)
+  
+  # We see some variations in shot conversion by shot type. The positive effect of shooting with a
+  # man advantage is apparent, as well as the apparent advantage gained from a shot being taken
+  # by a forward. However, it is important to note that forwards shoot closer to the net...
+    ggplot(dd, aes(arenaAdjustedShotDistance, fill = Position)) + geom_density(alpha = 0.2) 
+  # Shot types are also confounded by shot distance
+    ggplot(dd, aes(arenaAdjustedShotDistance, fill = shotType)) + geom_density(alpha = 0.2) 
+    
+    
+## Model fitting, variable selection and diagnostics
+    
+  # Before fitting some models, I'm going to scale the continuous predictors so that their
+  # coefficients are measured in a common currency
+    dd <- dd %>% mutate(distanceScaled = scale(arenaAdjustedShotDistance, scale = TRUE),
+                        angleScaled = scale(shotAngleAdjusted, scale = TRUE))
+    
+  # Just checking the histrograms to see if it worked...
+    hist(dd$angleScaled, col = "steelblue") # looks good
+    hist(dd$distanceScaled, col = "steelblue") # nice!
+    
+  # Our first model will include shot angle, shot distance and their interactions with game state. 
+  # Other fixed effects include the main effect of game state, shot type, Position, season, team 
+  # (HOME or AWAY) and indicators for whether or not the shot was a rush shot, rebound, was taken on 
+  # the offwing (side of the ice opposite to a shooters handedness) or if it was preceded by a 
+  # turnover. Our random effects will include a random intercept which varies by the shooter and
+  # opposing goaltender - these two random effects are crossed. The fit is commented out because it 
+  # takes a few minutes. The model is stored in an object called 'm0'
+    #m0 <- glmmTMB::glmmTMB(data = dd, goal ~ angleScaled*state + distanceScaled*state +
+            #Position + team + shotRebound + shotRush + shotTurnover + shotType + offWing + 
+            #season + (1|shooterName) + (1|goalieNameForShot), family = "binomial")
+    
+  # Let's take a look at the model summary...
+    summary(m0)
+    
+  # And a dotplot...
+    sjPlot::plot_model(m0)
+    
+  # Since our coefficients are less than 10 units in magnitude and their confidence intervals seem
+  # reasonable, we can rule out complete separation. Distance evidently has a very large negative 
+  # effect on the log-odds of a goal being scored. Season appears to have little effect on goal 
+  # probability and the same can be said for team venue and skater Position. Let's try to fit 
+  # a reduced model without these variables...
+    #m1 <- glmmTMB::glmmTMB(data = dd, goal ~ angleScaled*state + distanceScaled*state +
+            #shotRebound + shotRush + shotTurnover + shotType + offWing + (1|shooterName) + 
+            #(1|goalieNameForShot), family = "binomial")
+    
+    sjPlot::plot_model(m1)
+    
+  # and let's try also dropping the interaction terms involving game state
+    #m2 <- glmmTMB::glmmTMB(data = dd, goal ~ angleScaled + distanceScaled + state +
+            #shotRebound + shotRush + shotTurnover + shotType + offWing + (1|shooterName) + 
+            #(1|goalieNameForShot), family = "binomial")
+    
+    sjPlot::plot_model(m2)
+    
+  # Comparing the AICs of these three models...
+    AIC <- AIC(m0, m1, m2)
+    AIC <- transform(AIC, dAIC = AIC - AIC(m0))
+    print(AIC)
+    
+  # Our first model (m0) has the lowest AIC of the three. The difference of 2 units between m0
+  # and the next best model is non trivial and thus we will continue to do diagnostics with m0 as
+  # it likely has the most predictive value
+    
+
+## Model Diagnostics
+
+  # Since our model predicts binary outcomes, we're going to have to bin our residuals. We can do so
+  # with the arm package (should take ~30 seconds)
+    arm::binnedplot(fitted(m0), residuals(m0))
+    
+  # The upper and lower grey lines should contain about 95% of our bins in this plot. That appears to
+  # be the case, as only a few exceed these boundaries. Predictions with probabilities of about ~15%
+  # seem to be skewed above zero which is a bit concerning. Overall the binned residuals look okay.
+  # I would also like to examine some simulated residuals but this is difficult when we have
+  # so many observations
+        
+## Fitting the model to the entire data set
+    
+  # We'll use the same model formula as we did when we fit m0 but this time, it is fitted to the
+  # entire data set and the continuous predictors are not scaled. Warning: do no attempt to fit
+  # these - it took me well over an  hour for each
+    #final_model <- glmmTMB::glmmTMB(data = shots, goal ~ shotAngleAdjusted*state + 
+                      #arenaAdjustedShotDistance*state + Position + team + shotRebound + 
+                      #shotRush + shotTurnover + shotType + offWing + season + 
+                      #(1|shooterName) + (1|goalieNameForShot), family = "binomial")
+    
+  # and here's a version with scaled predictors...
+    shots <- shots %>% mutate(distanceScaled = scale(arenaAdjustedShotDistance, scale = TRUE),
+              angleScaled = scale(shotAngleAdjusted, scale = TRUE))
+    
+    #final_model.scaled <- glmmTMB::glmmTMB(data = shots, goal ~ angleScaled*state + 
+                            #distanceScaled*state + Position + team + shotRebound + 
+                            #shotRush + shotTurnover + shotType + offWing + season + 
+                            #(1|shooterName) + (1|goalieNameForShot), family = "binomial")
+      
+  # dot-whisker plot...
+    sjPlot::plot_model(final_model.scaled)
+    
+  # Once again we observe a very large negative effect on the log-odds of a goal as distance from
+  # the net increases. This negative relationship is weaker on the powerplay than it is at even
+  # strength but slightly stronger on the penalty kill. The odds ratio for rebound shots,
+  # rush shots and shots following turnovers are around 2, meaning that these scenarios double the 
+  # odds of a shot entering the net. We can see from the plot that larger shot angles from center
+  # ice reduce the odds of a goal and this makes sense given that the visible portion of the net
+  # is reduced as a shooter is situated further from center. Again, the power play game state 
+  # sees a slightly weaker relationship for the aforementioned factor. I suspect that the 
+  # luxury of having an extra skater allows shooters to be more selective and thus they may
+  # only settle for bad angle/long distance shots under unique circumstances (sprawling goalies/
+  # quick lateral passes). 
+    
+  # model summary
+    summary(final_model.scaled)
+    
+  # Standard deviations for our random effects are interesting. Shooters have a standard deviation
+  # of ~0.17 which is three times larger than we observe for the goaltender population
+  
+  # Comparing to model m0 used for diagnostics (coefficients should be very similar)
+    coefs <- as.data.frame(glmmTMB::fixef(m0)$cond) 
+    colnames(coefs)[1] = "sample"
+    coefs$full <- as.vector(glmmTMB::fixef(final_model.scaled)$cond)
+    colnames(coefs)[1] = "full"
+    
+    print(coefs) # estimates are very similar which is reassuring
+        
+  # Recall that we're actually most interested in the random effects, as these will help evaluate
+  # shooter and goaltending talent. Extracting the random effects estimates is straightforward...
+    
+    ran.eff <- glmmTMB::ranef(final_model)
+    shooters <- ran.eff$cond$shooterName
+    colnames(shooters)[1] = "est"
+    goalies <- ran.eff$cond$goalieNameForShot
+    colnames(goalies)[1] = "est"
+    
+  # It would help to have some measure of uncertainty. This is a bit tricky with glmmTMB but could
+  # be accomplished with the following code that I found posted on a forum by Dr. Bolker
+    #s1 <- TMB::sdreport(final_model$obj,getJointPrecision=TRUE)
+    #se <- sqrt(s1$diag.cov.random) # diagonal of random effects covariance matrix will gives us
+                                  # standard errors for each shooter and goaltender
+  
+  # Adding standard error columns to the random effects data frames...
+    shooters$se <- se[1:nrow(shooters)]
+    goalies$se <- se[(nrow(shooters)+1):length(se)]
+    
+  # Get 'confidence intervals' for random effect levels
+    shooters <- transform(shooters, lower = est - 1.96*se, upper = est + 1.96*se)
+    goalies <- transform(goalies, lower = est - 1.96*se, upper = est + 1.96*se)
+    
+  # Let's take a look at some of league's best shooters (according to this model)
+    shooters$shooter <- rownames(shooters)
+    ggplot(head(shooters[order(shooters$est, decreasing = T),]), aes(x=shooter, y=lower, 
+      col = shooter)) + geom_errorbar(width=.2, aes(ymin=lower, ymax=upper)) + 
+      labs(x="Skater",y= "Effect on log-odds of a goal",
+      title="Top Six Shooters According to the Model") + theme(legend.position = "none")
+    
+  # I'm not shocked to see this list of skaters as all have reputations as quality finishers. Patrik
+  # Laine stands out as the highest rated skater over the given time frame (last 4 seasons). We can
+  # take advantage of our model's simplicity to help contextualize Laine's insane shooting ability. 
+  # In our non-scaled model fit, the coefficient for shot distance is about -0.05 per foot from the 
+  # net. This means that for a typical Patrik Laine shot, it is as if he is 0.50/0.05 = 10 feet
+  # closer to the net than he really is! Put another way, all else equal, a league average shooter 
+  # would have to be 10 feet closer to the net than Laine in order to have the same odds of scoring.
+  # Of course, the relationship between distance and scoring odds is probably more complicated in
+  # reality and it's a big assumption to assume that Laine's distance-scoring probability 
+  # relationship is the same as the league average shooter. It's not perfect, but you get a
+  # rough idea of how deadly Laine's shot is (and how unsettling his presence must be for opposing 
+  # netminders)
+    
+  # let's look at our best goaltenders (this time, a lower coefficient is better as their job is 
+  # to reduce the odds of a goal)
+  
+    goalies$goalie <- rownames(goalies)
+    ggplot(head(goalies[order(goalies$est, decreasing = F),]), aes(x=goalie, y=lower, 
+      col = goalie)) + geom_errorbar(width=.2, aes(ymin=lower, ymax=upper)) + 
+      labs(x="Goaltender",y= "Effect on log-odds of a goal",
+      title="Top Six Goaltenders According to the Model") + theme(legend.position = "none")
+    
+  # As I mentioned before, the spread in goaltender estimates was much smaller than what was
+  # measured for shooters. Only 3 goaltenders have confidence intervals that do not contain 0 and
+  # all of them are among our six best (Andersen, Holty and Gibson). As we did with Laine,
+  # we can take our goaltender with the best estimate (Frederik Andersen) and use the distance
+  # coefficient to wrap our heads around his impact. In this case, his effect versus the average
+  # goaltender in only about 2 feet on a given shot. Not as stark as Laine's shooting effect,
+  # but keep in mind that goaltenders play the full 60 minutes (usually) and therefore get
+  # to influence a far greater number of shots.
+    
+  # Distribution of skater estimates
+    hist(shooters$est, col = "steelblue", main = "Skater Shooting Talent", 
+      xlab = "Random Effect Estimate")
+      abline(v = 0.53,col="red")
+      legend("topright",c("Patrik Laine On An Island"),   
+             col=c("red"), horiz=F, cex=0.8,
+             pch=c(NA),lty = c(1), bg="white")
+      
+  # Distribution of goalie estimates
+    hist(goalies$est, col = "steelblue", main = "Goalie Talent",
+      xlab = "Random Effect Estimate")
+    
+    
